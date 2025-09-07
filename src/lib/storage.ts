@@ -1,26 +1,11 @@
-import { supabase, isSupabaseEnabled } from './supabase';
-import { AppData, Team, User, Activity, ActivityType, TimeFilter, TeamStats, UserStats, UserAchievement } from './types';
-import { ACHIEVEMENTS, STREAK_MESSAGES } from './constants';
+import { supabase, isSupabaseEnabled } from './supabase'
+import type { AppData, Team, User, Activity, ActivityType, TimeFilter, TeamStats, UserStats, UserAchievement } from './types'
 
-const STORAGE_KEY = 'https://github.com/Manny1994RD/prodigal-son-points-system.gitprodigal-son-app-data';
-const APP_ID = '58dc1cc569';
+const STORAGE_KEY = 'prodigal-son-app-data'
 
-function getDefaultData(): AppData {
-  return {
-    teams: [
-      { id: '1', name: 'Equipo Rojo', members: [] },
-      { id: '2', name: 'Equipo Azul', members: [] },
-      { id: '3', name: 'Equipo Verde', members: [] },
-      { id: '4', name: 'Equipo Amarillo', members: [] },
-    ],
-    users: [],
-    activities: [],
-    activityTypes: getDefaultActivityTypes(),
-    userAchievements: [],
-    lastActivity: {}
-  };
-}
-
+/* ======================
+   Local (fallback) utils
+   ====================== */
 function getDefaultActivityTypes(): ActivityType[] {
   return [
     { id: '1', name: 'Simple', points: 1, isChecklistStyle: false },
@@ -42,14 +27,34 @@ function getDefaultActivityTypes(): ActivityType[] {
     { id: '17', name: 'Día Preparar', points: 50, isChecklistStyle: true },
     { id: '18', name: 'Carta Madre', points: 10, isChecklistStyle: true },
     { id: '19', name: 'Misión Online', points: 20, isChecklistStyle: true },
-  ];
+  ]
 }
 
-export async function getStoredData(): Promise<AppData> {
+function getDefaultData(): AppData {
+  return {
+    teams: [
+      { id: '1', name: 'Equipo Rojo', members: [] },
+      { id: '2', name: 'Equipo Azul', members: [] },
+      { id: '3', name: 'Equipo Verde', members: [] },
+      { id: '4', name: 'Equipo Amarillo', members: [] },
+    ],
+    users: [],
+    activities: [],
+    activityTypes: getDefaultActivityTypes(),
+    userAchievements: [],
+    lastActivity: {}
+  }
+}
+
+function saveLocal(data: AppData) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)) } catch {}
+}
+
+async function getLocal(): Promise<AppData> {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      const data = JSON.parse(stored);
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const data = JSON.parse(raw)
       return {
         teams: Array.isArray(data.teams) ? data.teams : [],
         users: Array.isArray(data.users) ? data.users : [],
@@ -57,374 +62,270 @@ export async function getStoredData(): Promise<AppData> {
         activityTypes: Array.isArray(data.activityTypes) ? data.activityTypes : getDefaultActivityTypes(),
         userAchievements: Array.isArray(data.userAchievements) ? data.userAchievements : [],
         lastActivity: data.lastActivity && typeof data.lastActivity === 'object' ? data.lastActivity : {}
-      };
+      }
     }
-  } catch (error) {
-    console.error('Error loading stored data:', error);
+  } catch {}
+  return getDefaultData()
+}
+
+/* ======================
+   Remote helpers
+   ====================== */
+function buildTeamsWithMembers(
+  rawTeams: { id: string; name: string }[],
+  users: { id: string; name: string; team_id: string | null }[]
+): Team[] {
+  const byTeam: Record<string, string[]> = {}
+  for (const u of users) {
+    if (!u.team_id) continue
+    byTeam[u.team_id] ||= []
+    byTeam[u.team_id].push(u.id)
   }
-  return getDefaultData();
+  return rawTeams.map(t => ({ id: t.id, name: t.name, members: byTeam[t.id] ?? [] }))
+}
+
+/* ======================
+   Public API
+   ====================== */
+export async function getStoredData(): Promise<AppData> {
+  // Remote-first for Teams/Users
+  if (isSupabaseEnabled) {
+    try {
+      const [{ data: teams, error: e1 }, { data: users, error: e2 }] = await Promise.all([
+        supabase.from('teams').select('id,name').order('created_at', { ascending: true }),
+        supabase.from('app_users').select('id,name,team_id')
+      ])
+      if (e1) throw e1
+      if (e2) throw e2
+
+      const teamsWithMembers = buildTeamsWithMembers(teams ?? [], users ?? [])
+
+      // Keep other sections from local until you migrate them
+      const localRaw = localStorage.getItem(STORAGE_KEY)
+      const local = localRaw ? JSON.parse(localRaw) : {}
+
+      return {
+        teams: teamsWithMembers,
+        users: (users ?? []).map(u => ({ id: u.id, name: u.name, teamId: u.team_id ?? '' })),
+        activities: Array.isArray(local.activities) ? local.activities : [],
+        activityTypes: Array.isArray(local.activityTypes) ? local.activityTypes : getDefaultActivityTypes(),
+        userAchievements: Array.isArray(local.userAchievements) ? local.userAchievements : [],
+        lastActivity: (local.lastActivity && typeof local.lastActivity === 'object') ? local.lastActivity : {}
+      }
+    } catch (err) {
+      console.error('getStoredData remote error:', err)
+    }
+  }
+  // Fallback
+  return getLocal()
 }
 
 export function saveData(data: AppData): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  } catch (error) {
-    console.error('Error saving data to localStorage:', error);
-  }
+  // Only affects local fallback pieces
+  saveLocal(data)
 }
 
-export async function getAllActivityTypes(): Promise<ActivityType[]> {
-  const data = await getStoredData();
-  return data.activityTypes;
-}
-
-export async function addActivity(activity: Omit<Activity, 'id'>): Promise<{ 
-  id: string; 
-  streakInfo: { message: string; streak: number }; 
-  newAchievements: UserAchievement[] 
-}> {
-  const data = await getStoredData();
-  const newActivity: Activity = {
-    ...activity,
-    id: Date.now().toString(),
-  };
-  
-  data.activities.push(newActivity);
-  saveData(data);
-  
-  return {
-    id: newActivity.id,
-    streakInfo: { message: '¡Sigue así!', streak: 1 },
-    newAchievements: []
-  };
-}
-
-export async function updateActivity(activityId: string, updates: Partial<Pick<Activity, 'quantity' | 'points'>>): Promise<void> {
-  const data = await getStoredData();
-  const activityIndex = data.activities.findIndex(a => a.id === activityId);
-  
-  if (activityIndex !== -1) {
-    data.activities[activityIndex] = { 
-      ...data.activities[activityIndex], 
-      ...updates 
-    };
-    saveData(data);
-  }
-}
-
-export async function deleteActivity(activityId: string): Promise<void> {
-  const data = await getStoredData();
-  data.activities = data.activities.filter(a => a.id !== activityId);
-  saveData(data);
-}
-
-export async function addUser(name: string, teamId: string): Promise<User> {
-  const data = await getStoredData();
-  const newUser: User = {
-    id: Date.now().toString(),
-    name: name.trim(),
-    teamId,
-  };
-  
-  data.users.push(newUser);
-  
-  const team = data.teams.find(t => t.id === teamId);
-  if (team && !team.members.includes(newUser.id)) {
-    team.members.push(newUser.id);
-  }
-  
-  saveData(data);
-  return newUser;
-}
-
+/* -------- Teams (REMOTE) -------- */
 export async function addTeam(name: string): Promise<Team> {
-  const data = await getStoredData();
-  const newTeam: Team = {
-    id: Date.now().toString(),
-    name: name.trim(),
-    members: []
-  };
-  
-  data.teams.push(newTeam);
-  saveData(data);
-  return newTeam;
-}
-
-export async function addActivityType(activityType: Omit<ActivityType, 'id'>): Promise<string> {
-  const data = await getStoredData();
-  const newActivityType: ActivityType = {
-    ...activityType,
-    id: Date.now().toString(),
-  };
-  
-  data.activityTypes.push(newActivityType);
-  saveData(data);
-  return newActivityType.id;
-}
-
-export async function updateUser(userId: string, updates: Partial<Omit<User, 'id'>>): Promise<void> {
-  const data = await getStoredData();
-  const userIndex = data.users.findIndex(u => u.id === userId);
-  
-  if (userIndex !== -1) {
-    const oldTeamId = data.users[userIndex].teamId;
-    data.users[userIndex] = { ...data.users[userIndex], ...updates };
-    
-    if (updates.teamId && updates.teamId !== oldTeamId) {
-      const oldTeam = data.teams.find(t => t.id === oldTeamId);
-      if (oldTeam) {
-        oldTeam.members = oldTeam.members.filter(id => id !== userId);
-      }
-      
-      const newTeam = data.teams.find(t => t.id === updates.teamId);
-      if (newTeam && !newTeam.members.includes(userId)) {
-        newTeam.members.push(userId);
-      }
-    }
-    
-    saveData(data);
+  if (isSupabaseEnabled) {
+    const { data, error } = await supabase
+      .from('teams')
+      .insert({ name: name.trim() })
+      .select('id,name')
+      .single()
+    if (error) throw error
+    return { id: data!.id, name: data!.name, members: [] }
   }
+  const data = await getLocal()
+  const newTeam: Team = { id: Date.now().toString(), name: name.trim(), members: [] }
+  data.teams.push(newTeam); saveLocal(data); return newTeam
 }
 
 export async function updateTeam(teamId: string, updates: Partial<Omit<Team, 'id' | 'members'>>): Promise<void> {
-  const data = await getStoredData();
-  const teamIndex = data.teams.findIndex(t => t.id === teamId);
-  
-  if (teamIndex !== -1) {
-    data.teams[teamIndex] = { ...data.teams[teamIndex], ...updates };
-    saveData(data);
+  if (isSupabaseEnabled) {
+    const patch: any = {}
+    if (updates.name !== undefined) patch.name = updates.name.trim()
+    const { error } = await supabase.from('teams').update(patch).eq('id', teamId)
+    if (error) throw error
+    return
   }
+  const data = await getLocal()
+  const i = data.teams.findIndex(t => t.id === teamId)
+  if (i !== -1) { data.teams[i] = { ...data.teams[i], ...updates }; saveLocal(data) }
 }
 
-export async function updateActivityType(activityTypeId: string, name: string, points: number): Promise<void> {
-  const data = await getStoredData();
-  const activityTypeIndex = data.activityTypes.findIndex(at => at.id === activityTypeId);
-  
-  if (activityTypeIndex !== -1) {
-    data.activityTypes[activityTypeIndex] = { 
-      ...data.activityTypes[activityTypeIndex], 
-      name: name.trim(), 
-      points 
-    };
-    saveData(data);
+export async function deleteTeam(teamId: string): Promise<void> {
+  if (isSupabaseEnabled) {
+    // set users.team_id = null then delete team
+    const { error: upErr } = await supabase.from('app_users').update({ team_id: null }).eq('team_id', teamId)
+    if (upErr) throw upErr
+    const { error: delErr } = await supabase.from('teams').delete().eq('id', teamId)
+    if (delErr) throw delErr
+    return
+  }
+  const data = await getLocal()
+  const usersInTeam = data.users.filter(u => u.teamId === teamId)
+  const remainingTeams = data.teams.filter(t => t.id !== teamId)
+  if (remainingTeams.length > 0) {
+    const firstTeam = remainingTeams[0]
+    usersInTeam.forEach(u => {
+      u.teamId = firstTeam.id
+      if (!firstTeam.members.includes(u.id)) firstTeam.members.push(u.id)
+    })
+  } else {
+    const ids = usersInTeam.map(u => u.id)
+    data.users = data.users.filter(u => !ids.includes(u.id))
+    data.activities = data.activities.filter(a => !ids.includes(a.userId))
+    if (Array.isArray(data.userAchievements)) {
+      data.userAchievements = data.userAchievements.filter(ua => !ids.includes(ua.userId))
+    }
+  }
+  data.teams = data.teams.filter(t => t.id !== teamId)
+  saveLocal(data)
+}
+
+/* -------- Users (REMOTE) -------- */
+export async function addUser(name: string, teamId: string): Promise<User> {
+  if (isSupabaseEnabled) {
+    const { data, error } = await supabase
+      .from('app_users')
+      .insert({ name: name.trim(), team_id: teamId || null })
+      .select('id,name,team_id')
+      .single()
+    if (error) throw error
+    return { id: data!.id, name: data!.name, teamId: data!.team_id ?? '' }
+  }
+  const data = await getLocal()
+  const newUser: User = { id: Date.now().toString(), name: name.trim(), teamId }
+  data.users.push(newUser)
+  const team = data.teams.find(t => t.id === teamId)
+  if (team && !team.members.includes(newUser.id)) team.members.push(newUser.id)
+  saveLocal(data); return newUser
+}
+
+export async function updateUser(userId: string, updates: Partial<Omit<User, 'id'>>): Promise<void> {
+  if (isSupabaseEnabled) {
+    const patch: any = {}
+    if (updates.name !== undefined) patch.name = updates.name.trim()
+    if (updates.teamId !== undefined) patch.team_id = updates.teamId || null
+    const { error } = await supabase.from('app_users').update(patch).eq('id', userId)
+    if (error) throw error
+    return
+  }
+  const data = await getLocal()
+  const i = data.users.findIndex(u => u.id === userId)
+  if (i !== -1) {
+    const oldTeamId = data.users[i].teamId
+    data.users[i] = { ...data.users[i], ...updates }
+    if (updates.teamId && updates.teamId !== oldTeamId) {
+      const oldTeam = data.teams.find(t => t.id === oldTeamId)
+      if (oldTeam) oldTeam.members = oldTeam.members.filter(id => id !== userId)
+      const newTeam = data.teams.find(t => t.id === updates.teamId)
+      if (newTeam && !newTeam.members.includes(userId)) newTeam.members.push(userId)
+    }
+    saveLocal(data)
   }
 }
 
 export async function deleteUser(userId: string): Promise<void> {
-  const data = await getStoredData();
-  
-  data.users = data.users.filter(u => u.id !== userId);
-  data.teams.forEach(team => {
-    team.members = team.members.filter(id => id !== userId);
-  });
-  data.activities = data.activities.filter(a => a.userId !== userId);
-  if (Array.isArray(data.userAchievements)) {
-    data.userAchievements = data.userAchievements.filter(ua => ua.userId !== userId);
+  if (isSupabaseEnabled) {
+    const { error } = await supabase.from('app_users').delete().eq('id', userId)
+    if (error) throw error
+    return
   }
-  
-  saveData(data);
+  const data = await getLocal()
+  data.users = data.users.filter(u => u.id !== userId)
+  data.teams.forEach(t => { t.members = t.members.filter(id => id !== userId) })
+  data.activities = data.activities.filter(a => a.userId !== userId)
+  if (Array.isArray(data.userAchievements)) {
+    data.userAchievements = data.userAchievements.filter(ua => ua.userId !== userId)
+  }
+  saveLocal(data)
 }
 
-export async function deleteTeam(teamId: string): Promise<void> {
-  const data = await getStoredData();
-  
-  const usersInTeam = data.users.filter(u => u.teamId === teamId);
-  const remainingTeams = data.teams.filter(t => t.id !== teamId);
-  
-  if (remainingTeams.length > 0) {
-    const firstTeam = remainingTeams[0];
-    usersInTeam.forEach(user => {
-      user.teamId = firstTeam.id;
-      if (!firstTeam.members.includes(user.id)) {
-        firstTeam.members.push(user.id);
-      }
-    });
-  } else {
-    const userIds = usersInTeam.map(u => u.id);
-    data.users = data.users.filter(u => !userIds.includes(u.id));
-    data.activities = data.activities.filter(a => !userIds.includes(a.userId));
-    if (Array.isArray(data.userAchievements)) {
-      data.userAchievements = data.userAchievements.filter(ua => !userIds.includes(ua.userId));
-    }
-  }
-  
-  data.teams = data.teams.filter(t => t.id !== teamId);
-  saveData(data);
+/* -------- Activities & Types (LOCAL for now) -------- */
+export async function getAllActivityTypes(): Promise<ActivityType[]> {
+  const d = await getStoredData(); return d.activityTypes
+}
+
+export async function addActivity(activity: Omit<Activity, 'id'>): Promise<{ id: string; streakInfo: { message: string; streak: number }; newAchievements: UserAchievement[] }> {
+  const data = await getLocal()
+  const newActivity: Activity = { ...activity, id: Date.now().toString() }
+  data.activities.push(newActivity); saveLocal(data)
+  return { id: newActivity.id, streakInfo: { message: '¡Sigue así!', streak: 1 }, newAchievements: [] }
+}
+
+export async function updateActivity(activityId: string, updates: Partial<Pick<Activity, 'quantity' | 'points'>>): Promise<void> {
+  const data = await getLocal()
+  const i = data.activities.findIndex(a => a.id === activityId)
+  if (i !== -1) { data.activities[i] = { ...data.activities[i], ...updates }; saveLocal(data) }
+}
+
+export async function deleteActivity(activityId: string): Promise<void> {
+  const data = await getLocal()
+  data.activities = data.activities.filter(a => a.id !== activityId); saveLocal(data)
+}
+
+export async function addActivityType(activityType: Omit<ActivityType, 'id'>): Promise<string> {
+  const data = await getLocal()
+  const newType: ActivityType = { ...activityType, id: Date.now().toString() }
+  data.activityTypes.push(newType); saveLocal(data); return newType.id
+}
+
+export async function updateActivityType(activityTypeId: string, name: string, points: number): Promise<void> {
+  const data = await getLocal()
+  const i = data.activityTypes.findIndex(at => at.id === activityTypeId)
+  if (i !== -1) { data.activityTypes[i] = { ...data.activityTypes[i], name: name.trim(), points }; saveLocal(data) }
 }
 
 export async function deleteActivityType(activityTypeId: string): Promise<void> {
-  const data = await getStoredData();
-  
-  data.activityTypes = data.activityTypes.filter(at => at.id !== activityTypeId);
-  data.activities = data.activities.filter(a => a.activityTypeId !== activityTypeId);
-  
-  saveData(data);
+  const data = await getLocal()
+  data.activityTypes = data.activityTypes.filter(at => at.id !== activityTypeId)
+  data.activities = data.activities.filter(a => a.activityTypeId !== activityTypeId)
+  saveLocal(data)
 }
 
+/* -------- Stats / CSV (local-only) -------- */
 export async function exportToCSV(): Promise<string> {
-  const data = await getStoredData();
-  const headers = ['Fecha', 'Usuario', 'Equipo', 'Actividad', 'Cantidad', 'Puntos Unitarios', 'Puntos Totales'];
-  
-  const rows = data.activities.map(activity => {
-    const user = data.users.find(u => u.id === activity.userId);
-    const team = data.teams.find(t => t.id === user?.teamId);
-    const activityType = data.activityTypes.find(at => at.id === activity.activityTypeId);
-    
+  const data = await getStoredData()
+  const headers = ['Fecha', 'Usuario', 'Equipo', 'Actividad', 'Cantidad', 'Puntos Unitarios', 'Puntos Totales']
+  const rows = data.activities.map(a => {
+    const u = data.users.find(x => x.id === a.userId)
+    const t = data.teams.find(x => x.id === u?.teamId)
+    const at = data.activityTypes.find(x => x.id === a.activityTypeId)
     return [
-      new Date(activity.date).toLocaleDateString(),
-      user?.name || 'Usuario desconocido',
-      team?.name || 'Equipo desconocido',
-      activityType?.name || 'Actividad desconocida',
-      activity.quantity?.toString() || '1',
-      activityType?.points?.toString() || '0',
-      activity.points?.toString() || '0'
-    ];
-  });
-  
-  const csvContent = [headers, ...rows]
-    .map(row => row.map(field => `"${field}"`).join(','))
-    .join('\n');
-  
-  return csvContent;
+      new Date(a.date ?? new Date()).toLocaleDateString(),
+      u?.name || 'Usuario desconocido',
+      t?.name || 'Equipo desconocido',
+      at?.name || 'Actividad desconocida',
+      String(a.quantity ?? 1),
+      String(at?.points ?? 0),
+      String(a.points ?? 0)
+    ]
+  })
+  return [headers, ...rows].map(r => r.map(f => \`"\${f}"\`).join(',')).join('\n')
 }
 
-function calculateStreak(activities: Activity[]): number {
-  if (activities.length === 0) return 0;
-  
-  // Sort activities by date (most recent first)
-  const sortedActivities = activities
-    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-  
-  let streak = 0;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  
-  // Check if there's an activity today
-  const todayStr = today.toISOString().split('T')[0];
-  const hasActivityToday = sortedActivities.some(activity => 
-    activity.date.split('T')[0] === todayStr
-  );
-  
-  if (!hasActivityToday) {
-    // Check if there was an activity yesterday
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayStr = yesterday.toISOString().split('T')[0];
-    const hasActivityYesterday = sortedActivities.some(activity => 
-      activity.date.split('T')[0] === yesterdayStr
-    );
-    
-    if (!hasActivityYesterday) {
-      return 0; // No recent activity, streak is broken
-    }
+export async function getUserStats(userId: string, _time: TimeFilter = 'all'): Promise<UserStats> {
+  const data = await getStoredData()
+  const u = data.users.find(x => x.id === userId)
+  if (!u) {
+    return { userId, userName: 'Unknown', teamId: '', teamName: 'Unknown', totalPoints: 0, totalActivities: 0, currentStreak: 0, achievements: [] }
   }
-  
-  // Count consecutive days with activities
-  const currentDate = new Date(today);
-  if (!hasActivityToday) {
-    currentDate.setDate(currentDate.getDate() - 1);
-  }
-  
-  for (let i = 0; i < 365; i++) { // Max 365 days to prevent infinite loop
-    const dateStr = currentDate.toISOString().split('T')[0];
-    const hasActivityOnDate = sortedActivities.some(activity => 
-      activity.date.split('T')[0] === dateStr
-    );
-    
-    if (hasActivityOnDate) {
-      streak++;
-      currentDate.setDate(currentDate.getDate() - 1);
-    } else {
-      break;
-    }
-  }
-  
-  return streak;
+  const t = data.teams.find(x => x.id === u.teamId)
+  const acts = data.activities.filter(a => a.userId === userId)
+  const totalPoints = acts.reduce((s, a) => s + (a.points ?? 0), 0)
+  const achievements = (data.userAchievements ?? []).filter(ua => ua.userId === userId)
+  return { userId, userName: u.name, teamId: u.teamId, teamName: t?.name || 'Unknown', totalPoints, totalActivities: acts.length, currentStreak: 0, achievements }
 }
 
-export async function getUserStats(userId: string, timeFilter: TimeFilter = 'all'): Promise<UserStats> {
-  const data = await getStoredData();
-  const user = data.users.find(u => u.id === userId);
-  
-  if (!user) {
-    return {
-      userId,
-      userName: 'Unknown',
-      teamId: '',
-      teamName: 'Unknown',
-      totalPoints: 0,
-      totalActivities: 0,
-      currentStreak: 0,
-      achievements: []
-    };
-  }
-  
-  const team = data.teams.find(t => t.id === user.teamId);
-  const userActivities = data.activities.filter(a => a.userId === userId);
-  const totalPoints = userActivities.reduce((sum, activity) => sum + (activity.points || 0), 0);
-  
-  const userAchievements = Array.isArray(data.userAchievements) 
-    ? data.userAchievements.filter(ua => ua.userId === userId)
-    : [];
-  
-  const currentStreak = calculateStreak(userActivities);
-  
-  return {
-    userId,
-    userName: user.name,
-    teamId: user.teamId,
-    teamName: team?.name || 'Unknown',
-    totalPoints,
-    totalActivities: userActivities.length,
-    currentStreak,
-    achievements: userAchievements
-  };
-}
-
-export async function getTeamStats(teamId: string, timeFilter: TimeFilter = 'all'): Promise<TeamStats> {
-  const data = await getStoredData();
-  const team = data.teams.find(t => t.id === teamId);
-  
-  if (!team) {
-    return {
-      teamId,
-      teamName: 'Unknown',
-      totalPoints: 0,
-      totalActivities: 0,
-      memberCount: 0,
-      members: []
-    };
-  }
-  
-  const teamMembers = data.users.filter(u => u.teamId === teamId);
-  const memberStats = await Promise.all(teamMembers.map(member => getUserStats(member.id, timeFilter)));
-  
-  const totalPoints = memberStats.reduce((sum, stats) => sum + stats.totalPoints, 0);
-  const totalActivities = memberStats.reduce((sum, stats) => sum + stats.totalActivities, 0);
-  
-  return {
-    teamId,
-    teamName: team.name,
-    totalPoints,
-    totalActivities,
-    memberCount: teamMembers.length,
-    members: memberStats
-  };
-}
-
-export async function getAllUserStats(timeFilter: TimeFilter = 'all'): Promise<UserStats[]> {
-  const data = await getStoredData();
-  const userStats = await Promise.all(data.users.map(user => getUserStats(user.id, timeFilter)));
-  return userStats;
-}
-
-export async function getAllTeamStats(timeFilter: TimeFilter = 'all'): Promise<TeamStats[]> {
-  const data = await getStoredData();
-  const teamStats = await Promise.all(data.teams.map(team => getTeamStats(team.id, timeFilter)));
-  return teamStats;
-}
-
-export async function clearAllData(): Promise<void> {
-  const defaultData = getDefaultData();
-  saveData(defaultData);
+export async function getTeamStats(teamId: string, _time: TimeFilter = 'all'): Promise<TeamStats> {
+  const data = await getStoredData()
+  const t = data.teams.find(x => x.id === teamId)
+  if (!t) return { teamId, teamName: 'Unknown', totalPoints: 0, totalActivities: 0, memberCount: 0, members: [] }
+  const members = data.users.filter(u => u.teamId === teamId)
+  const memberStats = await Promise.all(members.map(m => getUserStats(m.id)))
+  const totalPoints = memberStats.reduce((s, st) => s + st.totalPoints, 0)
+  const totalActivities = memberStats.reduce((s, st) => s + st.totalActivities, 0)
+  return { teamId, teamName: t.name, totalPoints, totalActivities, memberCount: members.length, members: memberStats }
 }
