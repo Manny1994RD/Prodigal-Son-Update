@@ -332,3 +332,19 @@ export async function getTeamStats(teamId: string, _time: TimeFilter = 'all'): P
   const totalActivities = memberStats.reduce((s, st) => s + st.totalActivities, 0)
   return { teamId, teamName: t.name, totalPoints, totalActivities, memberCount: members.length, members: memberStats }
 }
+
+
+/* -------- Bulk Stats helpers (needed by Leaderboard) -------- */
+export async function getAllUserStats(timeFilter: TimeFilter = 'all'): Promise<UserStats[]> {
+  const data = await getStoredData()
+  const users = data.users || []
+  const results = await Promise.all(users.map(u => getUserStats(u.id, timeFilter)))
+  return results
+}
+
+export async function getAllTeamStats(timeFilter: TimeFilter = 'all'): Promise<TeamStats[]> {
+  const data = await getStoredData()
+  const teams = data.teams || []
+  const results = await Promise.all(teams.map(t => getTeamStats(t.id, timeFilter)))
+  return results
+}
