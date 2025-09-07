@@ -303,7 +303,10 @@ export async function exportToCSV(): Promise<string> {
       String(a.points ?? 0)
     ]
   })
-  return [headers, ...rows].map(r => r.map(f => \`"\${f}"\`).join(',')).join('\n')
+  // Use string concatenation to avoid template literal backticks in build
+  return [headers, ...rows]
+    .map(r => r.map(f => '"' + String(f).replace(/"/g, '""') + '"').join(','))
+    .join('\n')
 }
 
 export async function getUserStats(userId: string, _time: TimeFilter = 'all'): Promise<UserStats> {
