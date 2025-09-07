@@ -2,7 +2,7 @@ import { supabase, isSupabaseEnabled } from './supabase';
 import { AppData, Team, User, Activity, ActivityType, TimeFilter, TeamStats, UserStats, UserAchievement } from './types';
 import { ACHIEVEMENTS, STREAK_MESSAGES } from './constants';
 
-const STORAGE_KEY = 'https://github.com/Manny1994RD/prodigal-son-points-system.gitprodigal-son-app-data';
+const STORAGE_KEY = 'prodigal-son-app-data';
 const APP_ID = '58dc1cc569';
 
 function getDefaultData(): AppData {
@@ -288,60 +288,6 @@ export async function exportToCSV(): Promise<string> {
   return csvContent;
 }
 
-function calculateStreak(activities: Activity[]): number {
-  if (activities.length === 0) return 0;
-  
-  // Sort activities by date (most recent first)
-  const sortedActivities = activities
-    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-  
-  let streak = 0;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  
-  // Check if there's an activity today
-  const todayStr = today.toISOString().split('T')[0];
-  const hasActivityToday = sortedActivities.some(activity => 
-    activity.date.split('T')[0] === todayStr
-  );
-  
-  if (!hasActivityToday) {
-    // Check if there was an activity yesterday
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayStr = yesterday.toISOString().split('T')[0];
-    const hasActivityYesterday = sortedActivities.some(activity => 
-      activity.date.split('T')[0] === yesterdayStr
-    );
-    
-    if (!hasActivityYesterday) {
-      return 0; // No recent activity, streak is broken
-    }
-  }
-  
-  // Count consecutive days with activities
-  const currentDate = new Date(today);
-  if (!hasActivityToday) {
-    currentDate.setDate(currentDate.getDate() - 1);
-  }
-  
-  for (let i = 0; i < 365; i++) { // Max 365 days to prevent infinite loop
-    const dateStr = currentDate.toISOString().split('T')[0];
-    const hasActivityOnDate = sortedActivities.some(activity => 
-      activity.date.split('T')[0] === dateStr
-    );
-    
-    if (hasActivityOnDate) {
-      streak++;
-      currentDate.setDate(currentDate.getDate() - 1);
-    } else {
-      break;
-    }
-  }
-  
-  return streak;
-}
-
 export async function getUserStats(userId: string, timeFilter: TimeFilter = 'all'): Promise<UserStats> {
   const data = await getStoredData();
   const user = data.users.find(u => u.id === userId);
@@ -367,8 +313,6 @@ export async function getUserStats(userId: string, timeFilter: TimeFilter = 'all
     ? data.userAchievements.filter(ua => ua.userId === userId)
     : [];
   
-  const currentStreak = calculateStreak(userActivities);
-  
   return {
     userId,
     userName: user.name,
@@ -376,7 +320,7 @@ export async function getUserStats(userId: string, timeFilter: TimeFilter = 'all
     teamName: team?.name || 'Unknown',
     totalPoints,
     totalActivities: userActivities.length,
-    currentStreak,
+    currentStreak: 0,
     achievements: userAchievements
   };
 }
@@ -410,21 +354,4 @@ export async function getTeamStats(teamId: string, timeFilter: TimeFilter = 'all
     memberCount: teamMembers.length,
     members: memberStats
   };
-}
-
-export async function getAllUserStats(timeFilter: TimeFilter = 'all'): Promise<UserStats[]> {
-  const data = await getStoredData();
-  const userStats = await Promise.all(data.users.map(user => getUserStats(user.id, timeFilter)));
-  return userStats;
-}
-
-export async function getAllTeamStats(timeFilter: TimeFilter = 'all'): Promise<TeamStats[]> {
-  const data = await getStoredData();
-  const teamStats = await Promise.all(data.teams.map(team => getTeamStats(team.id, timeFilter)));
-  return teamStats;
-}
-
-export async function clearAllData(): Promise<void> {
-  const defaultData = getDefaultData();
-  saveData(defaultData);
 }
