@@ -1,26 +1,15 @@
-import { supabase, isSupabaseEnabled } from './supabase';
-import { AppData, Team, User, Activity, ActivityType, TimeFilter, TeamStats, UserStats, UserAchievement } from './types';
-import { ACHIEVEMENTS, STREAK_MESSAGES } from './constants';
+// storage.ts
+import { supabase, isSupabaseEnabled } from './supabase'
+import type {
+  AppData, Team, User, Activity, ActivityType,
+  TimeFilter, TeamStats, UserStats, UserAchievement
+} from './types'
+import { ACHIEVEMENTS, STREAK_MESSAGES } from './constants'
 
-const STORAGE_KEY = 'prodigal-son-app-data';
-const APP_ID = '58dc1cc569';
+const STORAGE_KEY = 'prodigal-son-app-data'
+const APP_ID = '58dc1cc569' // (still unused; keep if you’ll shard storage later)
 
-function getDefaultData(): AppData {
-  return {
-    teams: [
-      { id: '1', name: 'Equipo Rojo', members: [] },
-      { id: '2', name: 'Equipo Azul', members: [] },
-      { id: '3', name: 'Equipo Verde', members: [] },
-      { id: '4', name: 'Equipo Amarillo', members: [] },
-    ],
-    users: [],
-    activities: [],
-    activityTypes: getDefaultActivityTypes(),
-    userAchievements: [],
-    lastActivity: {}
-  };
-}
-
+/* ---------- Local fallback (unchanged) ---------- */
 function getDefaultActivityTypes(): ActivityType[] {
   return [
     { id: '1', name: 'Simple', points: 1, isChecklistStyle: false },
@@ -42,14 +31,31 @@ function getDefaultActivityTypes(): ActivityType[] {
     { id: '17', name: 'Día Preparar', points: 50, isChecklistStyle: true },
     { id: '18', name: 'Carta Madre', points: 10, isChecklistStyle: true },
     { id: '19', name: 'Misión Online', points: 20, isChecklistStyle: true },
-  ];
+  ]
 }
-
-export async function getStoredData(): Promise<AppData> {
+function getDefaultData(): AppData {
+  return {
+    teams: [
+      { id: '1', name: 'Equipo Rojo', members: [] },
+      { id: '2', name: 'Equipo Azul', members: [] },
+      { id: '3', name: 'Equipo Verde', members: [] },
+      { id: '4', name: 'Equipo Amarillo', members: [] },
+    ],
+    users: [],
+    activities: [],
+    activityTypes: getDefaultActivityTypes(),
+    userAchievements: [],
+    lastActivity: {}
+  }
+}
+function saveLocal(data: AppData) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)) } catch {}
+}
+async function getLocal(): Promise<AppData> {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY);
+    const stored = localStorage.getItem(STORAGE_KEY)
     if (stored) {
-      const data = JSON.parse(stored);
+      const data = JSON.parse(stored)
       return {
         teams: Array.isArray(data.teams) ? data.teams : [],
         users: Array.isArray(data.users) ? data.users : [],
@@ -57,301 +63,351 @@ export async function getStoredData(): Promise<AppData> {
         activityTypes: Array.isArray(data.activityTypes) ? data.activityTypes : getDefaultActivityTypes(),
         userAchievements: Array.isArray(data.userAchievements) ? data.userAchievements : [],
         lastActivity: data.lastActivity && typeof data.lastActivity === 'object' ? data.lastActivity : {}
-      };
+      }
     }
-  } catch (error) {
-    console.error('Error loading stored data:', error);
+  } catch {}
+  return getDefaultData()
+}
+
+/* ---------- Supabase helpers ---------- */
+function toTeamMembersMap(users: { id: string; team_id: string | null }[]) {
+  const byTeam: Record<string, string[]> = {}
+  for (const u of users) {
+    if (!u.team_id) continue
+    byTeam[u.team_id] ||= []
+    byTeam[u.team_id].push(u.id)
   }
-  return getDefaultData();
+  return byTeam
+}
+
+async function seedActivityTypesIfEmpty() {
+  const { data, error } = await supabase.from('activity_types').select('id').limit(1)
+  if (error) throw error
+  if (data && data.length) return
+  const defaults = getDefaultActivityTypes().map(d => ({
+    name: d.name, points: d.points, is_checklist_style: d.isChecklistStyle
+  }))
+  await supabase.from('activity_types').insert(defaults)
+}
+
+async function getRemote(): Promise<AppData> {
+  await seedActivityTypesIfEmpty()
+
+  const [{ data: teams }, { data: users }, { data: acts }, { data: types }, { data: achieves }] =
+    await Promise.all([
+      supabase.from('teams').select('id,name').order('created_at', { ascending: true }),
+      supabase.from('app_users').select('id,name,team_id'),
+      supabase.from('activities').select('id,user_id,activity_type_id,date,quantity,points'),
+      supabase.from('activity_types').select('id,name,points,is_checklist_style'),
+      supabase.from('user_achievements').select('id,user_id,key,earned_at')
+    ])
+
+  const map = toTeamMembersMap(users ?? [])
+  const teamsWithMembers: Team[] = (teams ?? []).map(t => ({
+    id: t.id, name: t.name, members: map[t.id] ?? []
+  }))
+
+  const activityTypes: ActivityType[] = (types ?? []).map(t => ({
+    id: t.id, name: t.name, points: t.points, isChecklistStyle: !!t.is_checklist_style
+  }))
+
+  return {
+    teams: teamsWithMembers,
+    users: (users ?? []).map(u => ({ id: u.id, name: u.name, teamId: u.team_id ?? '' })),
+    activities: (acts ?? []).map(a => ({
+      id: a.id, userId: a.user_id, activityTypeId: a.activity_type_id,
+      date: a.date, quantity: a.quantity, points: a.points
+    })),
+    activityTypes,
+    userAchievements: (achieves ?? []).map(a => ({
+      id: a.id, userId: a.user_id, key: a.key, earnedAt: a.earned_at
+    })) as UserAchievement[],
+    lastActivity: {}
+  }
+}
+
+/* ---------- Public API (same names as yours) ---------- */
+export async function getStoredData(): Promise<AppData> {
+  if (isSupabaseEnabled) {
+    try { return await getRemote() } catch (e) { console.error(e) }
+  }
+  return getLocal()
 }
 
 export function saveData(data: AppData): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  } catch (error) {
-    console.error('Error saving data to localStorage:', error);
-  }
+  // Only affects local mode; remote writes happen in the CRUD below
+  saveLocal(data)
 }
 
 export async function getAllActivityTypes(): Promise<ActivityType[]> {
-  const data = await getStoredData();
-  return data.activityTypes;
-}
-
-export async function addActivity(activity: Omit<Activity, 'id'>): Promise<{ 
-  id: string; 
-  streakInfo: { message: string; streak: number }; 
-  newAchievements: UserAchievement[] 
-}> {
-  const data = await getStoredData();
-  const newActivity: Activity = {
-    ...activity,
-    id: Date.now().toString(),
-  };
-  
-  data.activities.push(newActivity);
-  saveData(data);
-  
-  return {
-    id: newActivity.id,
-    streakInfo: { message: '¡Sigue así!', streak: 1 },
-    newAchievements: []
-  };
-}
-
-export async function updateActivity(activityId: string, updates: Partial<Pick<Activity, 'quantity' | 'points'>>): Promise<void> {
-  const data = await getStoredData();
-  const activityIndex = data.activities.findIndex(a => a.id === activityId);
-  
-  if (activityIndex !== -1) {
-    data.activities[activityIndex] = { 
-      ...data.activities[activityIndex], 
-      ...updates 
-    };
-    saveData(data);
+  if (isSupabaseEnabled) {
+    const { data, error } = await supabase
+      .from('activity_types')
+      .select('id,name,points,is_checklist_style')
+      .order('created_at', { ascending: true })
+    if (error) throw error
+    return (data ?? []).map(t => ({
+      id: t.id, name: t.name, points: t.points, isChecklistStyle: !!t.is_checklist_style
+    }))
   }
+  const d = await getLocal(); return d.activityTypes
 }
 
-export async function deleteActivity(activityId: string): Promise<void> {
-  const data = await getStoredData();
-  data.activities = data.activities.filter(a => a.id !== activityId);
-  saveData(data);
+/* -------- Activities -------- */
+export async function addActivity(activity: Omit<Activity,'id'>) {
+  if (isSupabaseEnabled) {
+    const { data, error } = await supabase.from('activities')
+      .insert({
+        user_id: activity.userId,
+        activity_type_id: activity.activityTypeId,
+        date: activity.date ?? new Date().toISOString().slice(0,10),
+        quantity: activity.quantity ?? 1,
+        points: activity.points ?? 0
+      })
+      .select('id')
+      .single()
+    if (error) throw error
+    return { id: data!.id, streakInfo: { message: '¡Sigue así!', streak: 1 }, newAchievements: [] as UserAchievement[] }
+  }
+  // local fallback (your original)
+  const data = await getLocal()
+  const newActivity: Activity = { ...activity, id: Date.now().toString() }
+  data.activities.push(newActivity); saveLocal(data)
+  return { id: newActivity.id, streakInfo: { message: '¡Sigue así!', streak: 1 }, newAchievements: [] as UserAchievement[] }
 }
 
+export async function updateActivity(activityId: string, updates: Partial<Pick<Activity,'quantity'|'points'>>) {
+  if (isSupabaseEnabled) {
+    const patch: any = {}
+    if (updates.quantity !== undefined) patch.quantity = updates.quantity
+    if (updates.points !== undefined) patch.points = updates.points
+    const { error } = await supabase.from('activities').update(patch).eq('id', activityId)
+    if (error) throw error
+    return
+  }
+  const data = await getLocal()
+  const idx = data.activities.findIndex(a => a.id === activityId)
+  if (idx !== -1) { data.activities[idx] = { ...data.activities[idx], ...updates }; saveLocal(data) }
+}
+
+export async function deleteActivity(activityId: string) {
+  if (isSupabaseEnabled) {
+    const { error } = await supabase.from('activities').delete().eq('id', activityId)
+    if (error) throw error
+    return
+  }
+  const data = await getLocal()
+  data.activities = data.activities.filter(a => a.id !== activityId); saveLocal(data)
+}
+
+/* -------- Users -------- */
 export async function addUser(name: string, teamId: string): Promise<User> {
-  const data = await getStoredData();
-  const newUser: User = {
-    id: Date.now().toString(),
-    name: name.trim(),
-    teamId,
-  };
-  
-  data.users.push(newUser);
-  
-  const team = data.teams.find(t => t.id === teamId);
-  if (team && !team.members.includes(newUser.id)) {
-    team.members.push(newUser.id);
+  if (isSupabaseEnabled) {
+    const { data, error } = await supabase
+      .from('app_users')
+      .insert({ name: name.trim(), team_id: teamId || null })
+      .select('id,name,team_id')
+      .single()
+    if (error) throw error
+    return { id: data!.id, name: data!.name, teamId: data!.team_id ?? '' }
   }
-  
-  saveData(data);
-  return newUser;
+  const data = await getLocal()
+  const newUser: User = { id: Date.now().toString(), name: name.trim(), teamId }
+  data.users.push(newUser)
+  const team = data.teams.find(t => t.id === teamId)
+  if (team && !team.members.includes(newUser.id)) team.members.push(newUser.id)
+  saveLocal(data); return newUser
 }
 
-export async function addTeam(name: string): Promise<Team> {
-  const data = await getStoredData();
-  const newTeam: Team = {
-    id: Date.now().toString(),
-    name: name.trim(),
-    members: []
-  };
-  
-  data.teams.push(newTeam);
-  saveData(data);
-  return newTeam;
-}
-
-export async function addActivityType(activityType: Omit<ActivityType, 'id'>): Promise<string> {
-  const data = await getStoredData();
-  const newActivityType: ActivityType = {
-    ...activityType,
-    id: Date.now().toString(),
-  };
-  
-  data.activityTypes.push(newActivityType);
-  saveData(data);
-  return newActivityType.id;
-}
-
-export async function updateUser(userId: string, updates: Partial<Omit<User, 'id'>>): Promise<void> {
-  const data = await getStoredData();
-  const userIndex = data.users.findIndex(u => u.id === userId);
-  
-  if (userIndex !== -1) {
-    const oldTeamId = data.users[userIndex].teamId;
-    data.users[userIndex] = { ...data.users[userIndex], ...updates };
-    
+export async function updateUser(userId: string, updates: Partial<Omit<User,'id'>>) {
+  if (isSupabaseEnabled) {
+    const patch: any = {}
+    if (updates.name !== undefined) patch.name = updates.name.trim()
+    if (updates.teamId !== undefined) patch.team_id = updates.teamId || null
+    const { error } = await supabase.from('app_users').update(patch).eq('id', userId)
+    if (error) throw error
+    return
+  }
+  const data = await getLocal()
+  const i = data.users.findIndex(u => u.id === userId)
+  if (i !== -1) {
+    const oldTeamId = data.users[i].teamId
+    data.users[i] = { ...data.users[i], ...updates }
     if (updates.teamId && updates.teamId !== oldTeamId) {
-      const oldTeam = data.teams.find(t => t.id === oldTeamId);
-      if (oldTeam) {
-        oldTeam.members = oldTeam.members.filter(id => id !== userId);
-      }
-      
-      const newTeam = data.teams.find(t => t.id === updates.teamId);
-      if (newTeam && !newTeam.members.includes(userId)) {
-        newTeam.members.push(userId);
-      }
+      const oldTeam = data.teams.find(t => t.id === oldTeamId)
+      if (oldTeam) oldTeam.members = oldTeam.members.filter(id => id !== userId)
+      const newTeam = data.teams.find(t => t.id === updates.teamId)
+      if (newTeam && !newTeam.members.includes(userId)) newTeam.members.push(userId)
     }
-    
-    saveData(data);
+    saveLocal(data)
   }
 }
 
-export async function updateTeam(teamId: string, updates: Partial<Omit<Team, 'id' | 'members'>>): Promise<void> {
-  const data = await getStoredData();
-  const teamIndex = data.teams.findIndex(t => t.id === teamId);
-  
-  if (teamIndex !== -1) {
-    data.teams[teamIndex] = { ...data.teams[teamIndex], ...updates };
-    saveData(data);
+export async function deleteUser(userId: string) {
+  if (isSupabaseEnabled) {
+    const { error } = await supabase.from('app_users').delete().eq('id', userId)
+    if (error) throw error
+    // activities & achievements cascade via FK
+    return
   }
-}
-
-export async function updateActivityType(activityTypeId: string, name: string, points: number): Promise<void> {
-  const data = await getStoredData();
-  const activityTypeIndex = data.activityTypes.findIndex(at => at.id === activityTypeId);
-  
-  if (activityTypeIndex !== -1) {
-    data.activityTypes[activityTypeIndex] = { 
-      ...data.activityTypes[activityTypeIndex], 
-      name: name.trim(), 
-      points 
-    };
-    saveData(data);
-  }
-}
-
-export async function deleteUser(userId: string): Promise<void> {
-  const data = await getStoredData();
-  
-  data.users = data.users.filter(u => u.id !== userId);
-  data.teams.forEach(team => {
-    team.members = team.members.filter(id => id !== userId);
-  });
-  data.activities = data.activities.filter(a => a.userId !== userId);
+  const data = await getLocal()
+  data.users = data.users.filter(u => u.id !== userId)
+  data.teams.forEach(t => (t.members = t.members.filter(id => id !== userId)))
+  data.activities = data.activities.filter(a => a.userId !== userId)
   if (Array.isArray(data.userAchievements)) {
-    data.userAchievements = data.userAchievements.filter(ua => ua.userId !== userId);
+    data.userAchievements = data.userAchievements.filter(ua => ua.userId !== userId)
   }
-  
-  saveData(data);
+  saveLocal(data)
 }
 
-export async function deleteTeam(teamId: string): Promise<void> {
-  const data = await getStoredData();
-  
-  const usersInTeam = data.users.filter(u => u.teamId === teamId);
-  const remainingTeams = data.teams.filter(t => t.id !== teamId);
-  
+/* -------- Teams -------- */
+export async function addTeam(name: string): Promise<Team> {
+  if (isSupabaseEnabled) {
+    const { data, error } = await supabase
+      .from('teams')
+      .insert({ name: name.trim() })
+      .select('id,name')
+      .single()
+    if (error) throw error
+    return { id: data!.id, name: data!.name, members: [] }
+  }
+  const data = await getLocal()
+  const newTeam: Team = { id: Date.now().toString(), name: name.trim(), members: [] }
+  data.teams.push(newTeam); saveLocal(data); return newTeam
+}
+
+export async function updateTeam(teamId: string, updates: Partial<Omit<Team,'id'|'members'>>) {
+  if (isSupabaseEnabled) {
+    const patch: any = {}
+    if (updates.name !== undefined) patch.name = updates.name.trim()
+    const { error } = await supabase.from('teams').update(patch).eq('id', teamId)
+    if (error) throw error
+    return
+  }
+  const data = await getLocal()
+  const i = data.teams.findIndex(t => t.id === teamId)
+  if (i !== -1) { data.teams[i] = { ...data.teams[i], ...updates } ; saveLocal(data) }
+}
+
+export async function deleteTeam(teamId: string) {
+  if (isSupabaseEnabled) {
+    // Option A: reassign users in this team to NULL (or another team)
+    const { error: upErr } = await supabase.from('app_users').update({ team_id: null }).eq('team_id', teamId)
+    if (upErr) throw upErr
+    const { error: delErr } = await supabase.from('teams').delete().eq('id', teamId)
+    if (delErr) throw delErr
+    return
+  }
+  const data = await getLocal()
+  const usersInTeam = data.users.filter(u => u.teamId === teamId)
+  const remainingTeams = data.teams.filter(t => t.id !== teamId)
   if (remainingTeams.length > 0) {
-    const firstTeam = remainingTeams[0];
-    usersInTeam.forEach(user => {
-      user.teamId = firstTeam.id;
-      if (!firstTeam.members.includes(user.id)) {
-        firstTeam.members.push(user.id);
-      }
-    });
+    const firstTeam = remainingTeams[0]
+    usersInTeam.forEach(u => {
+      u.teamId = firstTeam.id
+      if (!firstTeam.members.includes(u.id)) firstTeam.members.push(u.id)
+    })
   } else {
-    const userIds = usersInTeam.map(u => u.id);
-    data.users = data.users.filter(u => !userIds.includes(u.id));
-    data.activities = data.activities.filter(a => !userIds.includes(a.userId));
+    const userIds = usersInTeam.map(u => u.id)
+    data.users = data.users.filter(u => !userIds.includes(u.id))
+    data.activities = data.activities.filter(a => !userIds.includes(a.userId))
     if (Array.isArray(data.userAchievements)) {
-      data.userAchievements = data.userAchievements.filter(ua => !userIds.includes(ua.userId));
+      data.userAchievements = data.userAchievements.filter(ua => !userIds.includes(ua.userId))
     }
   }
-  
-  data.teams = data.teams.filter(t => t.id !== teamId);
-  saveData(data);
+  data.teams = data.teams.filter(t => t.id !== teamId)
+  saveLocal(data)
 }
 
-export async function deleteActivityType(activityTypeId: string): Promise<void> {
-  const data = await getStoredData();
-  
-  data.activityTypes = data.activityTypes.filter(at => at.id !== activityTypeId);
-  data.activities = data.activities.filter(a => a.activityTypeId !== activityTypeId);
-  
-  saveData(data);
+/* -------- Activity Types -------- */
+export async function addActivityType(activityType: Omit<ActivityType,'id'>): Promise<string> {
+  if (isSupabaseEnabled) {
+    const { data, error } = await supabase.from('activity_types')
+      .insert({
+        name: activityType.name.trim(),
+        points: activityType.points,
+        is_checklist_style: !!activityType.isChecklistStyle
+      })
+      .select('id')
+      .single()
+    if (error) throw error
+    return data!.id
+  }
+  const data = await getLocal()
+  const newOne: ActivityType = { ...activityType, id: Date.now().toString() }
+  data.activityTypes.push(newOne); saveLocal(data); return newOne.id
 }
 
+export async function updateActivityType(activityTypeId: string, name: string, points: number) {
+  if (isSupabaseEnabled) {
+    const { error } = await supabase.from('activity_types')
+      .update({ name: name.trim(), points })
+      .eq('id', activityTypeId)
+    if (error) throw error
+    return
+  }
+  const data = await getLocal()
+  const i = data.activityTypes.findIndex(at => at.id === activityTypeId)
+  if (i !== -1) { data.activityTypes[i] = { ...data.activityTypes[i], name: name.trim(), points }; saveLocal(data) }
+}
+
+export async function deleteActivityType(activityTypeId: string) {
+  if (isSupabaseEnabled) {
+    // delete type and orphan its activities' type (set null) or cascade if you prefer
+    const { error } = await supabase.from('activity_types').delete().eq('id', activityTypeId)
+    if (error) throw error
+    return
+  }
+  const data = await getLocal()
+  data.activityTypes = data.activityTypes.filter(at => at.id !== activityTypeId)
+  data.activities = data.activities.filter(a => a.activityTypeId !== activityTypeId)
+  saveLocal(data)
+}
+
+/* -------- Stats / CSV (unchanged logic, but read from getStoredData) -------- */
 export async function exportToCSV(): Promise<string> {
-  const data = await getStoredData();
-  const headers = ['Fecha', 'Usuario', 'Equipo', 'Actividad', 'Cantidad', 'Puntos Unitarios', 'Puntos Totales'];
-  
-  const rows = data.activities.map(activity => {
-    const user = data.users.find(u => u.id === activity.userId);
-    const team = data.teams.find(t => t.id === user?.teamId);
-    const activityType = data.activityTypes.find(at => at.id === activity.activityTypeId);
-    
+  const data = await getStoredData()
+  const headers = ['Fecha','Usuario','Equipo','Actividad','Cantidad','Puntos Unitarios','Puntos Totales']
+  const rows = data.activities.map(a => {
+    const u = data.users.find(x => x.id === a.userId)
+    const t = data.teams.find(x => x.id === u?.teamId)
+    const at = data.activityTypes.find(x => x.id === a.activityTypeId)
     return [
-      new Date(activity.date).toLocaleDateString(),
-      user?.name || 'Usuario desconocido',
-      team?.name || 'Equipo desconocido',
-      activityType?.name || 'Actividad desconocida',
-      activity.quantity?.toString() || '1',
-      activityType?.points?.toString() || '0',
-      activity.points?.toString() || '0'
-    ];
-  });
-  
-  const csvContent = [headers, ...rows]
-    .map(row => row.map(field => `"${field}"`).join(','))
-    .join('\n');
-  
-  return csvContent;
+      new Date(a.date ?? new Date()).toLocaleDateString(),
+      u?.name || 'Usuario desconocido',
+      t?.name || 'Equipo desconocido',
+      at?.name || 'Actividad desconocida',
+      String(a.quantity ?? 1),
+      String(at?.points ?? 0),
+      String(a.points ?? 0)
+    ]
+  })
+  return [headers, ...rows].map(r => r.map(f => `"${f}"`).join(',')).join('\n')
 }
 
-export async function getUserStats(userId: string, timeFilter: TimeFilter = 'all'): Promise<UserStats> {
-  const data = await getStoredData();
-  const user = data.users.find(u => u.id === userId);
-  
-  if (!user) {
-    return {
-      userId,
-      userName: 'Unknown',
-      teamId: '',
-      teamName: 'Unknown',
-      totalPoints: 0,
-      totalActivities: 0,
-      currentStreak: 0,
-      achievements: []
-    };
+export async function getUserStats(userId: string, _time: TimeFilter = 'all'): Promise<UserStats> {
+  const data = await getStoredData()
+  const u = data.users.find(x => x.id === userId)
+  if (!u) {
+    return { userId, userName: 'Unknown', teamId: '', teamName: 'Unknown', totalPoints: 0, totalActivities: 0, currentStreak: 0, achievements: [] }
   }
-  
-  const team = data.teams.find(t => t.id === user.teamId);
-  const userActivities = data.activities.filter(a => a.userId === userId);
-  const totalPoints = userActivities.reduce((sum, activity) => sum + (activity.points || 0), 0);
-  
-  const userAchievements = Array.isArray(data.userAchievements) 
-    ? data.userAchievements.filter(ua => ua.userId === userId)
-    : [];
-  
+  const t = data.teams.find(x => x.id === u.teamId)
+  const acts = data.activities.filter(a => a.userId === userId)
+  const totalPoints = acts.reduce((s,a) => s + (a.points ?? 0), 0)
+  const achievements = (data.userAchievements ?? []).filter(ua => ua.userId === userId)
   return {
-    userId,
-    userName: user.name,
-    teamId: user.teamId,
-    teamName: team?.name || 'Unknown',
-    totalPoints,
-    totalActivities: userActivities.length,
-    currentStreak: 0,
-    achievements: userAchievements
-  };
+    userId, userName: u.name, teamId: u.teamId, teamName: t?.name || 'Unknown',
+    totalPoints, totalActivities: acts.length, currentStreak: 0, achievements
+  }
 }
 
-export async function getTeamStats(teamId: string, timeFilter: TimeFilter = 'all'): Promise<TeamStats> {
-  const data = await getStoredData();
-  const team = data.teams.find(t => t.id === teamId);
-  
-  if (!team) {
-    return {
-      teamId,
-      teamName: 'Unknown',
-      totalPoints: 0,
-      totalActivities: 0,
-      memberCount: 0,
-      members: []
-    };
-  }
-  
-  const teamMembers = data.users.filter(u => u.teamId === teamId);
-  const memberStats = await Promise.all(teamMembers.map(member => getUserStats(member.id, timeFilter)));
-  
-  const totalPoints = memberStats.reduce((sum, stats) => sum + stats.totalPoints, 0);
-  const totalActivities = memberStats.reduce((sum, stats) => sum + stats.totalActivities, 0);
-  
-  return {
-    teamId,
-    teamName: team.name,
-    totalPoints,
-    totalActivities,
-    memberCount: teamMembers.length,
-    members: memberStats
-  };
+export async function getTeamStats(teamId: string, _time: TimeFilter = 'all'): Promise<TeamStats> {
+  const data = await getStoredData()
+  const t = data.teams.find(x => x.id === teamId)
+  if (!t) return { teamId, teamName: 'Unknown', totalPoints: 0, totalActivities: 0, memberCount: 0, members: [] }
+  const members = data.users.filter(u => u.teamId === teamId)
+  const memberStats = await Promise.all(members.map(m => getUserStats(m.id)))
+  const totalPoints = memberStats.reduce((s, st) => s + st.totalPoints, 0)
+  const totalActivities = memberStats.reduce((s, st) => s + st.totalActivities, 0)
+  return { teamId, teamName: t.name, totalPoints, totalActivities, memberCount: members.length, members: memberStats }
 }
