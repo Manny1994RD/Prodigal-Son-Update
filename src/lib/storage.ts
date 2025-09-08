@@ -1,5 +1,9 @@
+// src/lib/storage.ts
 import { supabase, isSupabaseEnabled } from './supabase'
-import type { AppData, Team, User, Activity, ActivityType, TimeFilter, TeamStats, UserStats, UserAchievement } from './types'
+import type {
+  AppData, Team, User, Activity, ActivityType,
+  TimeFilter, TeamStats, UserStats, UserAchievement
+} from './types'
 
 const STORAGE_KEY = 'prodigal-son-app-data'
 
@@ -84,33 +88,53 @@ function buildTeamsWithMembers(
   return rawTeams.map(t => ({ id: t.id, name: t.name, members: byTeam[t.id] ?? [] }))
 }
 
+async function seedActivityTypesIfEmpty() {
+  const { data, error } = await supabase.from('activity_types').select('id').limit(1)
+  if (error) throw error
+  if (data && data.length) return
+  const defaults = getDefaultActivityTypes().map(d => ({
+    name: d.name, points: d.points, is_checklist_style: d.isChecklistStyle
+  }))
+  await supabase.from('activity_types').insert(defaults)
+}
+
 /* ======================
    Public API
    ====================== */
 export async function getStoredData(): Promise<AppData> {
-  // Remote-first for Teams/Users
   if (isSupabaseEnabled) {
     try {
-      const [{ data: teams, error: e1 }, { data: users, error: e2 }] = await Promise.all([
+      await seedActivityTypesIfEmpty()
+
+      const results = await Promise.all([
         supabase.from('teams').select('id,name').order('created_at', { ascending: true }),
-        supabase.from('app_users').select('id,name,team_id')
+        supabase.from('app_users').select('id,name,team_id'),
+        supabase.from('activity_types').select('id,name,points,is_checklist_style'),
+        supabase.from('activities').select('id,user_id,activity_type_id,date,quantity,points'),
+        supabase.from('user_achievements').select('id,user_id,key,earned_at')
       ])
+
+      const [{ data: teams, error: e1 },
+             { data: users, error: e2 },
+             { data: types, error: e3 },
+             { data: acts, error: e4 },
+             { data: achievements, error: e5 }] = results as any
+
       if (e1) throw e1
       if (e2) throw e2
+      if (e3) throw e3
+      if (e4) throw e4
+      if (e5) throw e5
 
       const teamsWithMembers = buildTeamsWithMembers(teams ?? [], users ?? [])
 
-      // Keep other sections from local until you migrate them
-      const localRaw = localStorage.getItem(STORAGE_KEY)
-      const local = localRaw ? JSON.parse(localRaw) : {}
-
       return {
         teams: teamsWithMembers,
-        users: (users ?? []).map(u => ({ id: u.id, name: u.name, teamId: u.team_id ?? '' })),
-        activities: Array.isArray(local.activities) ? local.activities : [],
-        activityTypes: Array.isArray(local.activityTypes) ? local.activityTypes : getDefaultActivityTypes(),
-        userAchievements: Array.isArray(local.userAchievements) ? local.userAchievements : [],
-        lastActivity: (local.lastActivity && typeof local.lastActivity === 'object') ? local.lastActivity : {}
+        users: (users ?? []).map((u: any) => ({ id: u.id, name: u.name, teamId: u.team_id ?? '' })),
+        activityTypes: (types ?? []).map((t: any) => ({ id: t.id, name: t.name, points: t.points, isChecklistStyle: !!t.is_checklist_style })),
+        activities: (acts ?? []).map((a: any) => ({ id: a.id, userId: a.user_id, activityTypeId: a.activity_type_id, date: a.date, quantity: a.quantity, points: a.points })),
+        userAchievements: (achievements ?? []).map((a: any) => ({ id: a.id, userId: a.user_id, key: a.key, earnedAt: a.earned_at })),
+        lastActivity: {}
       }
     } catch (err) {
       console.error('getStoredData remote error:', err)
@@ -156,7 +180,6 @@ export async function updateTeam(teamId: string, updates: Partial<Omit<Team, 'id
 
 export async function deleteTeam(teamId: string): Promise<void> {
   if (isSupabaseEnabled) {
-    // set users.team_id = null then delete team
     const { error: upErr } = await supabase.from('app_users').update({ team_id: null }).eq('team_id', teamId)
     if (upErr) throw upErr
     const { error: delErr } = await supabase.from('teams').delete().eq('id', teamId)
@@ -243,49 +266,111 @@ export async function deleteUser(userId: string): Promise<void> {
   saveLocal(data)
 }
 
-/* -------- Activities & Types (LOCAL for now) -------- */
+/* -------- Activity Types (REMOTE) -------- */
 export async function getAllActivityTypes(): Promise<ActivityType[]> {
-  const d = await getStoredData(); return d.activityTypes
-}
-
-export async function addActivity(activity: Omit<Activity, 'id'>): Promise<{ id: string; streakInfo: { message: string; streak: number }; newAchievements: UserAchievement[] }> {
-  const data = await getLocal()
-  const newActivity: Activity = { ...activity, id: Date.now().toString() }
-  data.activities.push(newActivity); saveLocal(data)
-  return { id: newActivity.id, streakInfo: { message: '¡Sigue así!', streak: 1 }, newAchievements: [] }
-}
-
-export async function updateActivity(activityId: string, updates: Partial<Pick<Activity, 'quantity' | 'points'>>): Promise<void> {
-  const data = await getLocal()
-  const i = data.activities.findIndex(a => a.id === activityId)
-  if (i !== -1) { data.activities[i] = { ...data.activities[i], ...updates }; saveLocal(data) }
-}
-
-export async function deleteActivity(activityId: string): Promise<void> {
-  const data = await getLocal()
-  data.activities = data.activities.filter(a => a.id !== activityId); saveLocal(data)
+  if (isSupabaseEnabled) {
+    const { data, error } = await supabase
+      .from('activity_types')
+      .select('id,name,points,is_checklist_style')
+      .order('name', { ascending: true })
+    if (error) throw error
+    return (data ?? []).map((t: any) => ({ id: t.id, name: t.name, points: t.points, isChecklistStyle: !!t.is_checklist_style }))
+  }
+  const d = await getLocal(); return d.activityTypes
 }
 
 export async function addActivityType(activityType: Omit<ActivityType, 'id'>): Promise<string> {
+  if (isSupabaseEnabled) {
+    const { data, error } = await supabase.from('activity_types')
+      .insert({ name: activityType.name.trim(), points: activityType.points, is_checklist_style: !!activityType.isChecklistStyle })
+      .select('id')
+      .single()
+    if (error) throw error
+    return data!.id
+  }
   const data = await getLocal()
-  const newType: ActivityType = { ...activityType, id: Date.now().toString() }
-  data.activityTypes.push(newType); saveLocal(data); return newType.id
+  const newOne: ActivityType = { ...activityType, id: Date.now().toString() }
+  data.activityTypes.push(newOne); saveLocal(data); return newOne.id
 }
 
-export async function updateActivityType(activityTypeId: string, name: string, points: number): Promise<void> {
+export async function updateActivityType(activityTypeId: string, name: string, points: number) {
+  if (isSupabaseEnabled) {
+    const { error } = await supabase.from('activity_types')
+      .update({ name: name.trim(), points })
+      .eq('id', activityTypeId)
+    if (error) throw error
+    return
+  }
   const data = await getLocal()
   const i = data.activityTypes.findIndex(at => at.id === activityTypeId)
   if (i !== -1) { data.activityTypes[i] = { ...data.activityTypes[i], name: name.trim(), points }; saveLocal(data) }
 }
 
-export async function deleteActivityType(activityTypeId: string): Promise<void> {
+export async function deleteActivityType(activityTypeId: string) {
+  if (isSupabaseEnabled) {
+    const { error } = await supabase.from('activity_types').delete().eq('id', activityTypeId)
+    if (error) throw error
+    return
+  }
   const data = await getLocal()
   data.activityTypes = data.activityTypes.filter(at => at.id !== activityTypeId)
   data.activities = data.activities.filter(a => a.activityTypeId !== activityTypeId)
   saveLocal(data)
 }
 
-/* -------- Stats / CSV (local-only) -------- */
+/* -------- Activities (REMOTE) -------- */
+export async function addActivity(activity: Omit<Activity, 'id'>): Promise<{ id: string; streakInfo: { message: string; streak: number }; newAchievements: UserAchievement[] }> {
+  if (isSupabaseEnabled) {
+    let pts = activity.points
+    if (pts == null) {
+      const { data: at, error: e } = await supabase.from('activity_types')
+        .select('points').eq('id', activity.activityTypeId).single()
+      if (e) throw e
+      const qty = activity.quantity ?? 1
+      pts = (at?.points ?? 0) * qty
+    }
+    const payload: any = {
+      user_id: activity.userId,
+      activity_type_id: activity.activityTypeId,
+      date: activity.date || new Date().toISOString().slice(0,10),
+      quantity: activity.quantity ?? 1,
+      points: pts ?? 0
+    }
+    const { data, error } = await supabase.from('activities').insert(payload).select('id').single()
+    if (error) throw error
+    return { id: data!.id, streakInfo: { message: '¡Sigue así!', streak: 1 }, newAchievements: [] }
+  }
+  const data = await getLocal()
+  const newActivity: Activity = { ...activity, id: Date.now().toString() }
+  data.activities.push(newActivity); saveLocal(data)
+  return { id: newActivity.id, streakInfo: { message: '¡Sigue así!', streak: 1 }, newAchievements: [] }
+}
+
+export async function updateActivity(activityId: string, updates: Partial<Pick<Activity, 'quantity' | 'points'>>) {
+  if (isSupabaseEnabled) {
+    const patch: any = {}
+    if (updates.quantity !== undefined) patch.quantity = updates.quantity
+    if (updates.points !== undefined) patch.points = updates.points
+    const { error } = await supabase.from('activities').update(patch).eq('id', activityId)
+    if (error) throw error
+    return
+  }
+  const data = await getLocal()
+  const i = data.activities.findIndex(a => a.id === activityId)
+  if (i !== -1) { data.activities[i] = { ...data.activities[i], ...updates }; saveLocal(data) }
+}
+
+export async function deleteActivity(activityId: string) {
+  if (isSupabaseEnabled) {
+    const { error } = await supabase.from('activities').delete().eq('id', activityId)
+    if (error) throw error
+    return
+  }
+  const data = await getLocal()
+  data.activities = data.activities.filter(a => a.id !== activityId); saveLocal(data)
+}
+
+/* -------- Stats / CSV -------- */
 export async function exportToCSV(): Promise<string> {
   const data = await getStoredData()
   const headers = ['Fecha', 'Usuario', 'Equipo', 'Actividad', 'Cantidad', 'Puntos Unitarios', 'Puntos Totales']
@@ -303,10 +388,9 @@ export async function exportToCSV(): Promise<string> {
       String(a.points ?? 0)
     ]
   })
-  // Use string concatenation to avoid template literal backticks in build
   return [headers, ...rows]
-    .map(r => r.map(f => '"' + String(f).replace(/"/g, '""') + '"').join(','))
-    .join('\n')
+    .map(r => r.map(f => '\"' + String(f).replace(/\"/g, '\"\"') + '\"').join(','))
+    .join('\\n')
 }
 
 export async function getUserStats(userId: string, _time: TimeFilter = 'all'): Promise<UserStats> {
@@ -333,8 +417,7 @@ export async function getTeamStats(teamId: string, _time: TimeFilter = 'all'): P
   return { teamId, teamName: t.name, totalPoints, totalActivities, memberCount: members.length, members: memberStats }
 }
 
-
-/* -------- Bulk Stats helpers (needed by Leaderboard) -------- */
+/* -------- Bulk Stats (Leaderboards) -------- */
 export async function getAllUserStats(timeFilter: TimeFilter = 'all'): Promise<UserStats[]> {
   const data = await getStoredData()
   const users = data.users || []
@@ -347,4 +430,17 @@ export async function getAllTeamStats(timeFilter: TimeFilter = 'all'): Promise<T
   const teams = data.teams || []
   const results = await Promise.all(teams.map(t => getTeamStats(t.id, timeFilter)))
   return results
+}
+
+/* -------- Realtime subscription helper -------- */
+export function subscribeToRealtime(onChange: () => void) {
+  if (!isSupabaseEnabled) return () => {}
+  const channel = supabase
+    .channel('realtime-all')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, onChange)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'app_users' }, onChange)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'activity_types' }, onChange)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'activities' }, onChange)
+    .subscribe()
+  return () => { supabase.removeChannel(channel) }
 }
