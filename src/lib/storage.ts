@@ -1,4 +1,3 @@
-// src/lib/storage.ts
 import { supabase, isSupabaseEnabled } from './supabase'
 import type {
   AppData, Team, User, Activity, ActivityType,
@@ -73,7 +72,7 @@ async function getLocal(): Promise<AppData> {
 }
 
 /* ======================
-   Remote helpers
+   Helpers (Supabase)
    ====================== */
 function buildTeamsWithMembers(
   rawTeams: { id: string; name: string }[],
@@ -96,6 +95,74 @@ async function seedActivityTypesIfEmpty() {
     name: d.name, points: d.points, is_checklist_style: d.isChecklistStyle
   }))
   await supabase.from('activity_types').insert(defaults)
+}
+
+/* ======================
+   Achievement logic
+   (keys chosen to be generic; map to your UI as you like)
+   ====================== */
+type Totals = { totalPoints: number; totalActivities: number; currentStreak: number }
+
+function ymd(d: Date) {
+  const z = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
+  return z.toISOString().slice(0,10)
+}
+
+function computeTotalsForUser(acts: { date: string; points?: number }[]): Totals {
+  const totalActivities = acts.length
+  const totalPoints = acts.reduce((s, a) => s + (a.points ?? 0), 0)
+
+  const dates = new Set<string>(acts.map(a => (a.date ?? '').slice(0,10)).filter(Boolean))
+  // current streak: count back from today
+  let cur = 0
+  const today = new Date()
+  while (true) {
+    const key = ymd(new Date(today.getFullYear(), today.getMonth(), today.getDate() - cur))
+    if (dates.has(key)) cur++
+    else break
+  }
+  return { totalPoints, totalActivities, currentStreak: cur }
+}
+
+const ACH_KEYS = {
+  FIRST: 'first_activity',
+  P100: 'points_100',
+  P500: 'points_500',
+  P1000: 'points_1000',
+  S3: 'streak_3',
+  S7: 'streak_7',
+} as const
+
+function decideNewAchievementKeys(t: Totals, ownedKeys: Set<string>): string[] {
+  const candidates: [string, boolean][] = [
+    [ACH_KEYS.FIRST, t.totalActivities >= 1],
+    [ACH_KEYS.P100, t.totalPoints >= 100],
+    [ACH_KEYS.P500, t.totalPoints >= 500],
+    [ACH_KEYS.P1000, t.totalPoints >= 1000],
+    [ACH_KEYS.S3, t.currentStreak >= 3],
+    [ACH_KEYS.S7, t.currentStreak >= 7],
+  ]
+  return candidates.filter(([k, ok]) => ok && !ownedKeys.has(k)).map(([k]) => k)
+}
+
+async function fetchUserAchievements(userId: string): Promise<UserAchievement[]> {
+  const { data, error } = await supabase
+    .from('user_achievements')
+    .select('id,user_id,key,earned_at')
+    .eq('user_id', userId)
+  if (error) throw error
+  return (data ?? []).map((a: any) => ({ id: a.id, userId: a.user_id, key: a.key, earnedAt: a.earned_at }))
+}
+
+async function insertUserAchievements(userId: string, keys: string[]): Promise<UserAchievement[]> {
+  if (!keys.length) return []
+  const rows = keys.map(k => ({ user_id: userId, key: k }))
+  const { data, error } = await supabase
+    .from('user_achievements')
+    .insert(rows)
+    .select('id,user_id,key,earned_at')
+  if (error) throw error
+  return (data ?? []).map((a: any) => ({ id: a.id, userId: a.user_id, key: a.key, earnedAt: a.earned_at }))
 }
 
 /* ======================
@@ -145,11 +212,10 @@ export async function getStoredData(): Promise<AppData> {
 }
 
 export function saveData(data: AppData): void {
-  // Only affects local fallback pieces
   saveLocal(data)
 }
 
-/* -------- Teams (REMOTE) -------- */
+/* -------- Teams -------- */
 export async function addTeam(name: string): Promise<Team> {
   if (isSupabaseEnabled) {
     const { data, error } = await supabase
@@ -207,7 +273,7 @@ export async function deleteTeam(teamId: string): Promise<void> {
   saveLocal(data)
 }
 
-/* -------- Users (REMOTE) -------- */
+/* -------- Users -------- */
 export async function addUser(name: string, teamId: string): Promise<User> {
   if (isSupabaseEnabled) {
     const { data, error } = await supabase
@@ -266,7 +332,7 @@ export async function deleteUser(userId: string): Promise<void> {
   saveLocal(data)
 }
 
-/* -------- Activity Types (REMOTE) -------- */
+/* -------- Activity Types -------- */
 export async function getAllActivityTypes(): Promise<ActivityType[]> {
   if (isSupabaseEnabled) {
     const { data, error } = await supabase
@@ -318,9 +384,10 @@ export async function deleteActivityType(activityTypeId: string) {
   saveLocal(data)
 }
 
-/* -------- Activities (REMOTE) -------- */
+/* -------- Activities (with auto-achievements) -------- */
 export async function addActivity(activity: Omit<Activity, 'id'>): Promise<{ id: string; streakInfo: { message: string; streak: number }; newAchievements: UserAchievement[] }> {
   if (isSupabaseEnabled) {
+    // Compute points if not provided
     let pts = activity.points
     if (pts == null) {
       const { data: at, error: e } = await supabase.from('activity_types')
@@ -338,8 +405,27 @@ export async function addActivity(activity: Omit<Activity, 'id'>): Promise<{ id:
     }
     const { data, error } = await supabase.from('activities').insert(payload).select('id').single()
     if (error) throw error
-    return { id: data!.id, streakInfo: { message: '¡Sigue así!', streak: 1 }, newAchievements: [] }
+
+    // Recompute totals + streak for the user
+    const { data: acts, error: aerr } = await supabase
+      .from('activities')
+      .select('date,points')
+      .eq('user_id', activity.userId)
+    if (aerr) throw aerr
+    const totals = computeTotalsForUser((acts ?? []).map((x:any)=>({date:x.date, points:x.points})))
+
+    // Award new achievements if any
+    const owned = await fetchUserAchievements(activity.userId)
+    const ownedKeys = new Set(owned.map(a => a.key))
+    const newKeys = decideNewAchievementKeys(totals, ownedKeys)
+    const newAchievements = await insertUserAchievements(activity.userId, newKeys)
+
+    // Simple streak message
+    const streakInfo = { message: totals.currentStreak >= 2 ? '🔥 ¡Racha en curso!' : '¡Sigue así!', streak: totals.currentStreak }
+
+    return { id: data!.id, streakInfo, newAchievements }
   }
+  // Local fallback
   const data = await getLocal()
   const newActivity: Activity = { ...activity, id: Date.now().toString() }
   data.activities.push(newActivity); saveLocal(data)
@@ -370,6 +456,59 @@ export async function deleteActivity(activityId: string) {
   data.activities = data.activities.filter(a => a.id !== activityId); saveLocal(data)
 }
 
+/* -------- Achievements direct helpers -------- */
+export async function addUserAchievement(userId: string, key: string): Promise<UserAchievement> {
+  if (!isSupabaseEnabled) throw new Error('Supabase disabled')
+  const { data, error } = await supabase
+    .from('user_achievements')
+    .insert({ user_id: userId, key })
+    .select('id,user_id,key,earned_at')
+    .single()
+  if (error) throw error
+  return { id: data!.id, userId: data!.user_id, key: data!.key, earnedAt: data!.earned_at }
+}
+
+export async function getUserAchievements(userId: string): Promise<UserAchievement[]> {
+  if (!isSupabaseEnabled) return []
+  return fetchUserAchievements(userId)
+}
+
+export async function backfillAchievements(): Promise<number> {
+  // Scan all users and ensure base achievements are awarded
+  const [{ data: users, error: uerr }, { data: acts, error: aerr }, { data: existing, error: eerr }] = await Promise.all([
+    supabase.from('app_users').select('id'),
+    supabase.from('activities').select('user_id,date,points'),
+    supabase.from('user_achievements').select('user_id,key')
+  ]) as any
+  if (uerr) throw uerr
+  if (aerr) throw aerr
+  if (eerr) throw eerr
+
+  const actsByUser: Record<string, {date:string;points?:number}[]> = {}
+  for (const a of (acts ?? [])) {
+    (actsByUser[a.user_id] ||= []).push({ date: a.date, points: a.points })
+  }
+  const ownedByUser = new Map<string, Set<string>>()
+  for (const e of (existing ?? [])) {
+    const set = ownedByUser.get(e.user_id) || new Set<string>()
+    set.add(e.key)
+    ownedByUser.set(e.user_id, set)
+  }
+
+  let inserted = 0
+  for (const u of (users ?? [])) {
+    const totals = computeTotalsForUser(actsByUser[u.id] ?? [])
+    const owned = ownedByUser.get(u.id) || new Set<string>()
+    const newKeys = decideNewAchievementKeys(totals, owned)
+    if (newKeys.length) {
+      const { error } = await supabase.from('user_achievements').insert(newKeys.map(k => ({ user_id: u.id, key: k })))
+      if (error) throw error
+      inserted += newKeys.length
+    }
+  }
+  return inserted
+}
+
 /* -------- Stats / CSV -------- */
 export async function exportToCSV(): Promise<string> {
   const data = await getStoredData()
@@ -389,8 +528,8 @@ export async function exportToCSV(): Promise<string> {
     ]
   })
   return [headers, ...rows]
-    .map(r => r.map(f => '\"' + String(f).replace(/\"/g, '\"\"') + '\"').join(','))
-    .join('\\n')
+    .map(r => r.map(f => '"' + String(f).replace(/"/g, '""') + '"').join(','))
+    .join('\n')
 }
 
 export async function getUserStats(userId: string, _time: TimeFilter = 'all'): Promise<UserStats> {
@@ -401,9 +540,15 @@ export async function getUserStats(userId: string, _time: TimeFilter = 'all'): P
   }
   const t = data.teams.find(x => x.id === u.teamId)
   const acts = data.activities.filter(a => a.userId === userId)
-  const totalPoints = acts.reduce((s, a) => s + (a.points ?? 0), 0)
+  const totals = computeTotalsForUser(acts.map(a => ({ date: a.date!, points: a.points })))
   const achievements = (data.userAchievements ?? []).filter(ua => ua.userId === userId)
-  return { userId, userName: u.name, teamId: u.teamId, teamName: t?.name || 'Unknown', totalPoints, totalActivities: acts.length, currentStreak: 0, achievements }
+  return {
+    userId, userName: u.name, teamId: u.teamId, teamName: t?.name || 'Unknown',
+    totalPoints: totals.totalPoints,
+    totalActivities: totals.totalActivities,
+    currentStreak: totals.currentStreak,
+    achievements
+  }
 }
 
 export async function getTeamStats(teamId: string, _time: TimeFilter = 'all'): Promise<TeamStats> {
@@ -417,7 +562,7 @@ export async function getTeamStats(teamId: string, _time: TimeFilter = 'all'): P
   return { teamId, teamName: t.name, totalPoints, totalActivities, memberCount: members.length, members: memberStats }
 }
 
-/* -------- Bulk Stats (Leaderboards) -------- */
+/* -------- Bulk Stats -------- */
 export async function getAllUserStats(timeFilter: TimeFilter = 'all'): Promise<UserStats[]> {
   const data = await getStoredData()
   const users = data.users || []
@@ -432,7 +577,7 @@ export async function getAllTeamStats(timeFilter: TimeFilter = 'all'): Promise<T
   return results
 }
 
-/* -------- Realtime subscription helper -------- */
+/* -------- Realtime -------- */
 export function subscribeToRealtime(onChange: () => void) {
   if (!isSupabaseEnabled) return () => {}
   const channel = supabase
@@ -441,6 +586,7 @@ export function subscribeToRealtime(onChange: () => void) {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'app_users' }, onChange)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'activity_types' }, onChange)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'activities' }, onChange)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'user_achievements' }, onChange)
     .subscribe()
   return () => { supabase.removeChannel(channel) }
 }
